@@ -169,6 +169,16 @@ class FPUDecoder(implicit p: Parameters) extends FPUModule()(p) {
     case (16, 32) => h ++ f
     case (32, 64) => f ++ d
     case (16, 64) => h ++ f ++ d ++ fcvt_hd
+    // FP16-only: NON-SPEC.  RISC-V requires "F" as the base for "Zfh",
+    // but for minimal-area FPGA targets we accept the spec violation
+    // and emit only the Zfh instruction patterns; FP32 ("S") and FP64
+    // ("D") ops fall through to `default` (all don't-cares) and the
+    // outer rocket decoder will reject them as illegal-instruction
+    // since the F bit is masked out of misa (see HasRocketCoreParameters
+    // / SaturnConfigs.WithRocketFPU16). Ported from chipyard-fsim
+    // garden tree to enable FP16-only Rocket FPU for the robotMpc
+    // FP-precision-stripping recipe.
+    case (16, 16) => h
     case other => throw new Exception(s"minFLen = ${minFLen} & fLen = ${fLen} is an unsupported configuration")
   }) ++ (if (usingVector) vfmv_f_s else Array[(BitPat, List[BitPat])]())
   val decoder = DecodeLogic(io.inst, default, insns)
@@ -472,12 +482,16 @@ class FPToInt(implicit p: Parameters) extends FPUModule()(p) {
   dcmp.io.signaling := !in.rm(1)
 
   val tag = in.typeTagOut
-  val toint_ieee = (floatTypes.map(t => if (t == FType.H) Fill(maxType.ieeeWidth / minXLen,   ieee(in.in1)(15, 0).sextTo(minXLen))
-                                        else              Fill(maxType.ieeeWidth / t.ieeeWidth, ieee(in.in1)(t.ieeeWidth - 1, 0))): Seq[UInt])(tag)
+  // `Fill(maxType.ieeeWidth / minXLen, ...)` evaluates to a zero-width
+  // `Fill(0, ...)` when maxType is FP16 (16-bit) and minXLen = 32 (RV64),
+  // which corrupts `WireDefault(toint_ieee)` below.  Guard with max(1, _)
+  // so the FP16-only (fLen=16) case produces a single minXLen-wide copy.
+  val toint_ieee = (floatTypes.map(t => if (t == FType.H) Fill(math.max(1, maxType.ieeeWidth / minXLen),   ieee(in.in1)(15, 0).sextTo(minXLen))
+                                        else              Fill(math.max(1, maxType.ieeeWidth / t.ieeeWidth), ieee(in.in1)(t.ieeeWidth - 1, 0))): Seq[UInt])(tag)
 
   val toint = WireDefault(toint_ieee)
   val intType = WireDefault(in.fmt(0))
-  io.out.bits.store := (floatTypes.map(t => Fill(fLen / t.ieeeWidth, ieee(in.in1)(t.ieeeWidth - 1, 0))): Seq[UInt])(tag)
+  io.out.bits.store := (floatTypes.map(t => Fill(math.max(1, fLen / t.ieeeWidth), ieee(in.in1)(t.ieeeWidth - 1, 0))): Seq[UInt])(tag)
   io.out.bits.toint := ((0 until nIntTypes).map(i => toint((minXLen << i) - 1, 0).sextTo(xLen)): Seq[UInt])(intType)
   io.out.bits.exc := 0.U
 
@@ -870,9 +884,17 @@ class FPU(cfg: FPUParams)(implicit p: Parameters) extends FPUModule()(p) {
     req
   }
 
-  val sfma = Module(new FPUFMAPipe(cfg.sfmaLatency, FType.S))
-  sfma.io.in.valid := req_valid && ex_ctrl.fma && ex_ctrl.typeTagOut === S
-  sfma.io.in.bits := fuInput(Some(sfma.t))
+  // FP32 FMA is the *historically* unconditional precision in the
+  // Rocket FPU — it always existed regardless of FPU width.  We
+  // gate it behind fLen >= 32 to support a (minFLen, fLen) = (16, 16)
+  // configuration where the FPU has *only* FP16 hardware.  Note that
+  // when fLen=16, sfma is None, so the `pipes` list below must not
+  // reference it.
+  val sfma = if (fLen >= 32) Some(Module(new FPUFMAPipe(cfg.sfmaLatency, FType.S))) else None
+  sfma.foreach { f =>
+    f.io.in.valid := req_valid && ex_ctrl.fma && ex_ctrl.typeTagOut === S
+    f.io.in.bits := fuInput(Some(f.t))
+  }
 
   val fpiu = Module(new FPToInt)
   fpiu.io.in.valid := req_valid && (ex_ctrl.toint || ex_ctrl.div || ex_ctrl.sqrt || (ex_ctrl.fastpipe && ex_ctrl.wflags))
@@ -908,8 +930,8 @@ class FPU(cfg: FPUParams)(implicit p: Parameters) extends FPUModule()(p) {
   case class Pipe(p: Module, lat: Int, cond: (FPUCtrlSigs) => Bool, res: FPResult)
   val pipes = List(
     Pipe(fpmu, fpmu.latency, (c: FPUCtrlSigs) => c.fastpipe, fpmu.io.out.bits),
-    Pipe(ifpu, ifpu.latency, (c: FPUCtrlSigs) => c.fromint, ifpu.io.out.bits),
-    Pipe(sfma, sfma.latency, (c: FPUCtrlSigs) => c.fma && c.typeTagOut === S, sfma.io.out.bits)) ++
+    Pipe(ifpu, ifpu.latency, (c: FPUCtrlSigs) => c.fromint, ifpu.io.out.bits)) ++
+    sfma.map(f => Pipe(f, f.latency, (c: FPUCtrlSigs) => c.fma && c.typeTagOut === S, f.io.out.bits)) ++
     (fLen > 32).option({
           val dfma = Module(new FPUFMAPipe(cfg.dfmaLatency, FType.D))
           dfma.io.in.valid := req_valid && ex_ctrl.fma && ex_ctrl.typeTagOut === D

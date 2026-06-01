@@ -291,6 +291,16 @@ class WithoutFPU            extends RocketCoreConfig(_.copy(fpu = None))
 class WithFP16              extends RocketCoreConfig(c => c.copy(fpu = c.fpu.map(_.copy(minFLen = 16))))
 class WithFPUWithoutDivSqrt extends RocketCoreConfig(c => c.copy(fpu = c.fpu.map(_.copy(divSqrt = false))))
 
+// FP-stripping knobs to match Saturn FP-precision-stripping recipes.
+// WithRocketFPU32: drop FP64 — keep FP32-only Rocket FPU.
+// WithRocketFPU16: drop FP32+FP64 — FP16-only Rocket FPU (NON-SPEC, see
+//                   FPU.scala (16,16) case).  Companion to Saturn's
+//                   VectorParams.robotMpcParams.
+class WithRocketFPU32 extends RocketCoreConfig(c => c.copy(
+  fpu = c.fpu.map(_.copy(fLen = 32))))
+class WithRocketFPU16 extends RocketCoreConfig(c => c.copy(
+  fpu = c.fpu.map(_.copy(minFLen = 16, fLen = 16))))
+
 // mul-div configs
 class WithFastMulDiv extends RocketCoreConfig(c => c.copy(mulDiv = Some(
   MulDivParams(mulUnroll = 8, mulEarlyOut = c.xLen > 32, divEarlyOut = true)
