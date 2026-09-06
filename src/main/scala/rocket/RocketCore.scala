@@ -414,6 +414,16 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
      mem_reg_valid && mem_ctrl.rocc || wb_reg_valid && wb_ctrl.rocc)
   val id_csr_rocc_write = tile.roccCSRs.flatten.map(_.id.U === id_inst(0)(31,20)).orR && id_csr_en && !id_csr_ren
   val id_vec_busy = io.vector.map(v => v.backend_busy || v.trap_check_busy).getOrElse(false.B)
+  // SATURN FIX (saturn-vmem-irq-defer): defer async interrupts while a vector memory
+  // op is mid-flight in the Saturn frontend fault-check (PipelinedFaultCheck /
+  // IterativeFaultCheck / replay). The ifc has no async abort and set_vstart fires
+  // only on sync xcpt/retire, so an interrupt there commits mepc=<vmem op> with a
+  // stale vstart -> mis-resume to wrong element -> wild store. Deferring until the op
+  // leaves the frontend guarantees the interrupt is taken at vstart==0. Gate ONLY on
+  // trap_check_busy: gating on backend_busy would starve the timer during sustained
+  // vector work and break preemption.
+  val id_vec_tc_busy    = io.vector.map(_.trap_check_busy).getOrElse(false.B)
+  val id_take_interrupt = csr.io.interrupt && !id_vec_tc_busy
   val id_do_fence = WireDefault(id_rocc_busy && (id_ctrl.fence || id_csr_rocc_write) ||
     id_vec_busy && id_ctrl.fence ||
     id_mem_busy && (id_ctrl.amo && id_amo_rl || id_ctrl.fence_i || id_reg_fence && (id_ctrl.mem || id_ctrl.rocc)))
@@ -532,7 +542,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   ex_reg_valid := !ctrl_killd
   ex_reg_replay := !take_pc && ibuf.io.inst(0).valid && ibuf.io.inst(0).bits.replay
   ex_reg_xcpt := !ctrl_killd && id_xcpt
-  ex_reg_xcpt_interrupt := !take_pc && ibuf.io.inst(0).valid && csr.io.interrupt
+  ex_reg_xcpt_interrupt := !take_pc && ibuf.io.inst(0).valid && id_take_interrupt
 
   when (!ctrl_killd) {
     ex_ctrl := id_ctrl
@@ -1072,7 +1082,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
     csr.io.csr_stall ||
     id_reg_pause ||
     io.traceStall
-  ctrl_killd := !ibuf.io.inst(0).valid || ibuf.io.inst(0).bits.replay || take_pc_mem_wb || ctrl_stalld || csr.io.interrupt
+  ctrl_killd := !ibuf.io.inst(0).valid || ibuf.io.inst(0).bits.replay || take_pc_mem_wb || ctrl_stalld || id_take_interrupt
 
   io.imem.req.valid := take_pc
   io.imem.req.bits.speculative := !take_pc_wb
