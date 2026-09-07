@@ -73,7 +73,7 @@ trait CoreParams {
   def vfLen: Int = 0
   def vfh: Boolean = false
   def vExts: Seq[String] = Nil
-  def hasV: Boolean = vLen >= 128 && eLen >= 64 && vfLen >= 64
+  def hasV: Boolean = vLen >= 128 && eLen >= 64 && (vfLen >= 64 || (useVector && vfLen == 0)) // int-only Saturn advertises base V (Zve64x)
   def vMemDataBits: Int = 0
 
   def useBitmanip = useZba && useZbb && useZbs

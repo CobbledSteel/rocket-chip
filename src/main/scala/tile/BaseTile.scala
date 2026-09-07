@@ -111,7 +111,7 @@ trait HasNonDiplomaticTileParameters {
     val d = if (tileParams.core.fpu.nonEmpty && tileParams.core.fpu.get.fLen > 32) "d" else ""
     val c = if (tileParams.core.useCompressed) "c" else ""
     val b = if (tileParams.core.useBitmanip) "b" else ""
-    val v = if (tileParams.core.useVector && tileParams.core.vLen >= 128 && tileParams.core.eLen == 64 && tileParams.core.vfLen == 64) "v" else ""
+    val v = if (tileParams.core.useVector && tileParams.core.vLen >= 128 && tileParams.core.eLen == 64 && (tileParams.core.vfLen == 64 || tileParams.core.vfLen == 0)) "v" else ""
     val h = if (usingHypervisor) "h" else ""
 
     val ext_strs = Seq(
