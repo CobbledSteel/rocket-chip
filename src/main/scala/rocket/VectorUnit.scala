@@ -68,6 +68,7 @@ class VectorCoreIO(implicit p: Parameters) extends CoreBundle()(p) {
 
   val trap_check_busy = Output(Bool())
   val backend_busy = Output(Bool())
+  val vec_mem_busy = Output(Bool()) // V-race #2 backend-gate: vector memory (VMU/mem interfaces) in flight, excl. vu-arith
 }
 
 abstract class RocketVectorUnit(implicit p: Parameters) extends LazyModule {

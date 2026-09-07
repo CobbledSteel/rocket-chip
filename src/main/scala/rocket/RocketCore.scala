@@ -423,7 +423,8 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   // trap_check_busy: gating on backend_busy would starve the timer during sustained
   // vector work and break preemption.
   val id_vec_tc_busy    = io.vector.map(_.trap_check_busy).getOrElse(false.B)
-  val id_take_interrupt = csr.io.interrupt && !id_vec_tc_busy
+  val id_vec_mem_busy   = io.vector.map(_.vec_mem_busy).getOrElse(false.B)
+  val id_take_interrupt = csr.io.interrupt && !id_vec_tc_busy && !id_vec_mem_busy
   val id_do_fence = WireDefault(id_rocc_busy && (id_ctrl.fence || id_csr_rocc_write) ||
     id_vec_busy && id_ctrl.fence ||
     id_mem_busy && (id_ctrl.amo && id_amo_rl || id_ctrl.fence_i || id_reg_fence && (id_ctrl.mem || id_ctrl.rocc)))
