@@ -590,8 +590,35 @@ class CSRFile(
   val reg_mcountinhibit = RegInit(0.U((CSR.firstHPM + nPerfCounters).W))
   io.inhibit_cycle := reg_mcountinhibit(0)
   val reg_instret = WideCounter(64, io.retire, inhibit = reg_mcountinhibit(2))
+  // TACIT-MULTICORE-MCYCLE-FREE-RUN
+  //
+  // mcycle is the timebase every TACIT packet's delta-timestamp is measured in, and it is
+  // per-hart. Upstream gates it on `!io.csr_stall`, and `io.csr_stall = reg_wfi ||
+  // io.status.cease` -- so the counter STOPS for as long as the hart sits in `wfi`. Two
+  // harts that idle for different amounts of time then hold two different timebases, and
+  // their traces cannot be placed on one timeline: the skew is exactly the difference in
+  // accumulated idle time and it only ever grows.
+  //
+  // Measured on this SoC before the change: k_msleep(1) advanced mcycle by 3,002 cycles
+  // over 1.15 ms of wall time (46 mtime ticks at 40 kHz = 46,000 core cycles at 40 MHz),
+  // i.e. ~7% of the elapsed cycles. See fpga/pynq-z2/docs/TACIT_MULTICORE.md.
+  //
+  // WHAT THIS CHANGES: exactly one term of the counter's enable -- `reg_wfi` is removed.
+  //   * `io.status.cease` is KEPT as a stop condition. CEASE retires the hart for good
+  //     (power-down); there is no trace after it and no timebase to keep aligned.
+  //   * `mcountinhibit(0)` is UNTOUCHED and still inhibits the counter. It is
+  //     architectural state software is entitled to use, and Zicntr's CY inhibit bit must
+  //     keep working.
+  //   * `io.csr_stall` itself is unchanged and still gates the pipeline; only the cycle
+  //     counter stops consuming it.
+  //
+  // This is architecturally legal: the RISC-V privileged spec leaves it implementation-
+  // defined whether mcycle counts while the hart is stalled in a low-power state, and a
+  // free-running cycle counter is the common choice. It does change the MEANING of every
+  // rdcycle-based measurement in software that sleeps: a `wfi` now costs its real wall
+  // time. That is the intended semantics -- mcycle becomes a clock, not an activity meter.
   val reg_cycle = if (enableCommitLog) WideCounter(64, io.retire,     inhibit = reg_mcountinhibit(0))
-    else withClock(io.ungated_clock) { WideCounter(64, !io.csr_stall, inhibit = reg_mcountinhibit(0)) }
+    else withClock(io.ungated_clock) { WideCounter(64, !io.status.cease, inhibit = reg_mcountinhibit(0)) }
   val reg_hpmevent = io.counters.map(c => RegInit(0.U(xLen.W)))
     (io.counters zip reg_hpmevent) foreach { case (c, e) => c.eventSel := e }
   val reg_hpmcounter = io.counters.zipWithIndex.map { case (c, i) =>
