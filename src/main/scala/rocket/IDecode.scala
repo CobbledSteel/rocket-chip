@@ -523,6 +523,44 @@ class ZbsDecode(implicit val p: Parameters) extends DecodeConstants
   )
 }
 
+/* MBP -- the packed-SIMD four, R-type in custom-0 (opcode 0x0B), funct7 = 0,
+ * funct3 = 0 DOT8 / 1 MAX8 / 2 QMUL / 3 CLIP8.  The contract is
+ * fpga/pynq-z2/sw/pext.h; the encoding is PEXT_SPEC.md section 3.0.
+ *
+ *  31      25 24   20 19   15 14 12 11    7 6         0
+ * +----------+-------+-------+-----+-------+-----------+
+ * | funct7=0 |  rs2  |  rs1  |  f3 |  rd   | 0001011   |
+ * +----------+-------+-------+-----+-------+-----------+
+ *
+ * These are NOT in the generated Instructions object -- riscv-opcodes has no entry
+ * for a non-standard extension -- so they are written out here.  They are strictly
+ * narrower than RoCCDecode's CUSTOM0* patterns (which ignore funct7 and read funct3
+ * as a register-usage code), which is why Rocket refuses to elaborate usePExt
+ * together with RoCC; see the require in RocketCore.scala.
+ */
+object MBPInstructions {
+  def MBP_DOT8  = BitPat("b0000000??????????000?????0001011")
+  def MBP_MAX8  = BitPat("b0000000??????????001?????0001011")
+  def MBP_QMUL  = BitPat("b0000000??????????010?????0001011")
+  def MBP_CLIP8 = BitPat("b0000000??????????011?????0001011")
+}
+
+class PExtDecode(implicit val p: Parameters) extends DecodeConstants
+{
+  import MBPInstructions._
+  /* All four are two-read, one-write, single-cycle ALU ops with a full 64-bit
+   * result, so DW_XPR -- not DW_32, which would sign-extend the answer from bit 31
+   * and silently break DOT8's range and QMUL's top bit.  CLIP8 ignores rs2 and the
+   * intrinsic encodes x0, but rxs2 is declared anyway: reading x0 is free, it
+   * cannot raise a hazard, and it keeps the four rows identical. */
+  val table: Array[(BitPat, List[BitPat])] = Array(
+    MBP_DOT8 -> List(Y,N,N,N,N,N,Y,Y,A2_RS2, A1_RS1,IMM_X,DW_XPR,FN_PDOT8, N,M_X,        N,N,N,N,N,N,Y,CSR.N,N,N,N,N),
+    MBP_MAX8 -> List(Y,N,N,N,N,N,Y,Y,A2_RS2, A1_RS1,IMM_X,DW_XPR,FN_PMAX8, N,M_X,        N,N,N,N,N,N,Y,CSR.N,N,N,N,N),
+    MBP_QMUL -> List(Y,N,N,N,N,N,Y,Y,A2_RS2, A1_RS1,IMM_X,DW_XPR,FN_PQMUL, N,M_X,        N,N,N,N,N,N,Y,CSR.N,N,N,N,N),
+    MBP_CLIP8-> List(Y,N,N,N,N,N,Y,Y,A2_RS2, A1_RS1,IMM_X,DW_XPR,FN_PCLIP8,N,M_X,        N,N,N,N,N,N,Y,CSR.N,N,N,N,N),
+  )
+}
+
 class RoCCDecode(implicit val p: Parameters) extends DecodeConstants
 {
   val table: Array[(BitPat, List[BitPat])] = Array(
@@ -550,4 +588,18 @@ class RoCCDecode(implicit val p: Parameters) extends DecodeConstants
     CUSTOM3_RD->        List(Y,N,Y,N,N,N,N,N,A2_ZERO,A1_RS1, IMM_X, DW_XPR,FN_ADD,   N,M_X,N,N,N,N,N,N,Y,CSR.N,N,N,N,N),
     CUSTOM3_RD_RS1->    List(Y,N,Y,N,N,N,N,Y,A2_ZERO,A1_RS1, IMM_X, DW_XPR,FN_ADD,   N,M_X,N,N,N,N,N,N,Y,CSR.N,N,N,N,N),
     CUSTOM3_RD_RS1_RS2->List(Y,N,Y,N,N,N,Y,Y,A2_ZERO,A1_RS1, IMM_X, DW_XPR,FN_ADD,   N,M_X,N,N,N,N,N,N,Y,CSR.N,N,N,N,N))
+}
+
+// patches/0101.  RoCCDecode claims all four custom opcodes whenever a tile has a RoCC, and
+// LazyRoCC's command router never raises ready for an opcode no accelerator declared -- so an
+// undeclared custom instruction HANGS the hart instead of trapping.  A configuration that sets
+// RoCCDecodeOpcodes to the 7-bit major opcodes its accelerators use gets this table instead,
+// and every other custom instruction decodes as illegal and traps.  None (the default)
+// leaves RocketCore constructing the plain RoCCDecode, exactly as before.
+case object RoCCDecodeOpcodes extends org.chipsalliance.cde.config.Field[Option[Seq[BigInt]]](None)
+
+class RoCCDecodeDeclared(opcodes: Seq[BigInt])(implicit val p: Parameters) extends DecodeConstants
+{
+  val table: Array[(BitPat, List[BitPat])] =
+    new RoCCDecode().table.filter { case (pat, _) => opcodes.contains(pat.value & 0x7f) }
 }

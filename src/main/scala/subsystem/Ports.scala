@@ -44,6 +44,17 @@ case class SlavePortParams(beatBytes: Int, idBits: Int, sourceBits: Int)
 // if incohBase is set, creates an incoherent alias for the region that hangs off the sbus
 case class MemoryPortParams(master: MasterPortParams, nMemoryChannels: Int, incohBase: Option[BigInt] = None)
 
+/** A TLBuffer between the memory bus and each ExtMem channel's TLToAXI4.  Opt-in.
+  *
+  * With several clients on the memory bus, the path from a client's A channel through the
+  * mbus crossbar, TLToAXI4's per-source stall lookup and the AXI4UserYanker queues -- and
+  * the ready that fans back across every crossbar input -- is combinational, and it grows
+  * with the number of clients and sources (iiswc-tutorial fpga/pynq-z2/docs/MEMORY_BANDWIDTH.md
+  * section 8: 15 logic levels, 13.9 ns, with four clients).  This cuts it at one cycle of
+  * latency each way.  False leaves the chain textually, and the generated Verilog exactly,
+  * as it was. */
+case object ExtMemPortBuffer extends Field[Boolean](false)
+
 case object ExtMem extends Field[Option[MemoryPortParams]](None)
 case object ExtBus extends Field[Option[MasterPortParams]](None)
 case object ExtIn extends Field[Option[SlavePortParams]](None)
@@ -104,6 +115,18 @@ trait CanHaveMasterAXI4MemPort { this: BaseSubsystem =>
       })
     })
 
+    if (p(ExtMemPortBuffer)) {
+      mbus.coupleTo(s"memory_controller_port_named_$portName") {
+        (DisableMonitors { implicit p => memAXI4Node := AXI4UserYanker() }
+          := AXI4IdIndexer(idBits)
+          := TLToAXI4()
+          := TLWidthWidget(mbus.beatBytes)
+          := TLBuffer()
+          := mem_bypass_xbar
+          := _
+        )
+      }
+    } else {
     mbus.coupleTo(s"memory_controller_port_named_$portName") {
       // Disable monitors on this connection since the class with this trait (i.e. DigitalTop) doesn't provide an
       // implicit clock for the monitor.
@@ -114,6 +137,7 @@ trait CanHaveMasterAXI4MemPort { this: BaseSubsystem =>
         := mem_bypass_xbar
         := _
       )
+    }
     }
   }
 

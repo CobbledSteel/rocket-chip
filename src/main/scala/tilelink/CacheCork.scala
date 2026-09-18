@@ -17,6 +17,14 @@ import freechips.rocketchip.util.IDPool
 
 import freechips.rocketchip.util.DataToAugmentedData
 
+/** Serve the cork's locally generated ReleaseAcks AHEAD of the outer GrantData on the inner
+  * D channel.  The default arbitration is data-first; under a dense miss stream through an
+  * InclusiveCache that starves ReleaseAcks, fills the 2-entry ReleaseAck queue, stops the
+  * cache scheduling Releases, and so delays every Acquire behind them (iiswc-tutorial
+  * fpga/pynq-z2/docs/MEMORY_BANDWIDTH.md section 6).  Opt-in: false leaves the arbiter, and
+  * the generated Verilog, exactly as they were. */
+case object TLCacheCorkReleaseAckFirst extends Field[Boolean](false)
+
 case class TLCacheCorkParams(
   unsafe: Boolean = false,
   sinkIds: Int = 8)
@@ -169,7 +177,11 @@ class TLCacheCork(params: TLCacheCorkParams = TLCacheCorkParams())(implicit p: P
 
         // Combine the sources of messages into the channels
         TLArbiter(TLArbiter.lowestIndexFirst)(out.a, (edgeOut.numBeats1(c_a.bits), c_a), (edgeOut.numBeats1(a_a.bits), a_a))
-        TLArbiter(TLArbiter.lowestIndexFirst)(in_d,  (edgeIn .numBeats1(d_d.bits), d_d), (0.U, Queue(c_d, 2)), (0.U, Queue(a_d, 2)))
+        if (p(TLCacheCorkReleaseAckFirst)) {
+          TLArbiter(TLArbiter.lowestIndexFirst)(in_d,  (0.U, Queue(c_d, 2)), (edgeIn .numBeats1(d_d.bits), d_d), (0.U, Queue(a_d, 2)))
+        } else {
+          TLArbiter(TLArbiter.lowestIndexFirst)(in_d,  (edgeIn .numBeats1(d_d.bits), d_d), (0.U, Queue(c_d, 2)), (0.U, Queue(a_d, 2)))
+        }
 
         // Tie off unused ports
         in.b.valid := false.B

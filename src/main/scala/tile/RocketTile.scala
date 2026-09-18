@@ -309,4 +309,14 @@ trait HasFpuOpt { this: RocketTileModuleImp =>
       fpu.io.cp_resp.ready := false.B
     }
   }
+  // No scalar FPU (WithoutFPU) but a vector unit is present (e.g. int-only Saturn):
+  // its scalar-FP offload port has no FPU to talk to, so tie it off here, else
+  // vector_unit.io_fp_req_ready / io_fp_resp_* are uninitialized sinks.
+  if (fpuOpt.isEmpty) {
+    outer.vector_unit.foreach { vu =>
+      vu.module.io.fp_req.ready := false.B
+      vu.module.io.fp_resp.valid := false.B
+      vu.module.io.fp_resp.bits := DontCare
+    }
+  }
 }

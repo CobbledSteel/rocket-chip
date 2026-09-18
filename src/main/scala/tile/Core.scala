@@ -28,6 +28,11 @@ trait CoreParams {
   val useZba: Boolean
   val useZbb: Boolean
   val useZbs: Boolean
+  // MBP -- the packed-SIMD four in custom-0 (fpga/pynq-z2/docs/PEXT_SPEC.md).  A
+  // CONCRETE default, unlike the abstract vals above, so that every other core that
+  // implements CoreParams (BOOM, Shuttle, the groundtest and tracegen tiles ...) needs
+  // no change; RocketCoreParams overrides it.
+  def usePExt: Boolean = false
   val mulDiv: Option[MulDivParams]
   val fpu: Option[FPUParams]
   val fetchWidth: Int

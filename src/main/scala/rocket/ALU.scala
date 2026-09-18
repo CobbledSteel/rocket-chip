@@ -33,6 +33,17 @@ object ALU {
   def FN_ROR  = 18.U
   def FN_BEXT = 19.U
 
+  // MBP -- the packed-SIMD four, ALU-integrated, custom-0.  See
+  // fpga/pynq-z2/docs/PEXT_SPEC.md and the bit-exact C reference in
+  // fpga/pynq-z2/sw/pext.h.  20-23 and 27 are the only free codes in this 5-bit
+  // space (0-19, 24-26 and 28-31 are taken); four ops take four of them, and 27
+  // is left for a fifth.
+  def FN_PDOT8  = 20.U
+  def FN_PMAX8  = 21.U
+  def FN_PQMUL  = 22.U
+  def FN_PCLIP8 = 23.U
+  def FN_PEXT   = BitPat("b101??")   // 20..23, i.e. exactly the four above
+
   def FN_ANDN = 24.U
   def FN_ORN  = 25.U
   def FN_XNOR = 26.U
@@ -160,10 +171,58 @@ class ALU(implicit p: Parameters) extends AbstractALU()(p) {
   val rotout_l = Reverse(rotout_r)
   val rotout = Mux(io.fn(0), rotout_r, rotout_l) | Mux(io.fn(0), shout_l, shout_r)
 
+  // MBP packed SIMD -- DOT8, MAX8, QMUL, CLIP8.  Elaborated only when
+  // coreParams.usePExt, so a hart without it gets an ALU that is bit-identical to
+  // the stock one (that is the property the patch's before/after Verilog diff checks).
+  //
+  // THE SPECIFICATION IS fpga/pynq-z2/sw/pext.h's mb_pext_*_sw.  If this and that
+  // disagree, this is wrong.  Adapted from the measured out-of-context datapaths in
+  // fpga/pynq-z2/rtl_study/pext/: pext_pdot8_lut.v (depth-3, ACC=0, signed only),
+  // pext_pmaxmin8.v (max, signed), and the pmulscale/clamp halves of
+  // pext_prequant.v -- NOT its fused requant2, whose 48-bit rounding barrel shifter
+  // is what missed timing (PEXT_FEASIBILITY.md 1.4).
+  val pext_ops: Seq[(UInt, UInt)] = if (!coreParams.usePExt) Nil else {
+    require(xLen == 64, "MBP packed SIMD is defined on RV64 only (8 int8 lanes per register)")
+    val a8 = io.in1.asTypeOf(Vec(8, SInt(8.W)))
+    val b8 = io.in2.asTypeOf(Vec(8, SInt(8.W)))
+
+    // MBP.DOT8: eight signed 8x8 products summed by a depth-3 balanced adder tree.
+    // |result| <= 8*128*128 = 131072, so 19 bits signed is exact; the 64-bit
+    // destination can never overflow and there is no saturation to get wrong.
+    val prod = (a8 zip b8).map { case (x, y) => x * y }        // SInt(16.W) each
+    val dot1 = Seq.tabulate(4)(i => prod(2*i) +& prod(2*i+1))  // 17 bits
+    val dot2 = Seq.tabulate(2)(i => dot1(2*i) +& dot1(2*i+1))  // 18 bits
+    val dot  = dot2(0) +& dot2(1)                              // 19 bits
+    val dot8 = Cat(Fill(xLen - 19, dot(18)), dot.asUInt)
+
+    // MBP.MAX8: eight independent signed byte maxima.  ReLU is this against x0.
+    val max8 = VecInit((a8 zip b8).map { case (x, y) => Mux(x > y, x, y) }).asUInt
+
+    // MBP.QMUL: (sext32(rs1) * sext32(rs2) + 2^30) >>> 31.
+    // ROUND-HALF-UP: add the rounding constant, then an ARITHMETIC shift.  Not
+    // half-away-from-zero and not half-to-even -- that difference is 1 LSB on
+    // roughly half of all negative outputs.  The product and the sum are exact
+    // (64 and 65 bits), so this is the C expression with no approximation in it.
+    val qprod = io.in1(31,0).asSInt * io.in2(31,0).asSInt      // SInt(64.W), exact
+    val qsum  = qprod +& (BigInt(1) << 30).S                   // SInt(65.W), exact
+    val qhi   = qsum >> 31                                     // SInt(34.W), arithmetic
+    val qmul  = Cat(Fill(xLen - 34, qhi(33)), qhi.asUInt)
+
+    // MBP.CLIP8: sext64(clamp(rs1, -128, +127)); rs2 ignored.  Two levels: the
+    // clamp is decided by the bits above the byte, not by a comparator chain.
+    val cq  = io.in1
+    val chi = ~cq(xLen-1) &  cq(xLen-2,7).orR    // > +127
+    val clo =  cq(xLen-1) & ~cq(xLen-2,7).andR   // < -128
+    val cb  = Mux(chi, 0x7f.U(8.W), Mux(clo, 0x80.U(8.W), cq(7,0)))
+    val clip8 = Cat(Fill(xLen - 8, cb(7)), cb)
+
+    Seq(FN_PDOT8 -> dot8, FN_PMAX8 -> max8, FN_PQMUL -> qmul, FN_PCLIP8 -> clip8)
+  }
+
   val out = MuxLookup(io.fn, shift_logic_cond)(Seq(
     FN_ADD -> io.adder_out,
     FN_SUB -> io.adder_out
-  ) ++ (if (coreParams.useZbb) Seq(
+  ) ++ pext_ops ++ (if (coreParams.useZbb) Seq(
     FN_UNARY -> unary,
     FN_MAX -> maxmin_out,
     FN_MIN -> maxmin_out,

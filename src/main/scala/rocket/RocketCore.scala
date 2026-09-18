@@ -30,6 +30,10 @@ case class RocketCoreParams(
   useZba: Boolean = false,
   useZbb: Boolean = false,
   useZbs: Boolean = false,
+  // MBP -- the packed-SIMD four in custom-0, integrated into the ALU as a
+  // single-cycle two-read op.  Per-tile, so a big.LITTLE pair can give it to the big
+  // hart only; the LITTLE hart then traps on it.  fpga/pynq-z2/docs/PEXT_SPEC.md.
+  override val usePExt: Boolean = false,
   nLocalInterrupts: Int = 0,
   useNMI: Boolean = false,
   nBreakpoints: Int = 1,
@@ -220,13 +224,21 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
       ("L2 TLB miss", () => io.ptw.perf.l2miss)))))
 
   val pipelinedMul = usingMulDiv && mulDivParams.mulUnroll == xLen
+
+  // MBP packed SIMD claims R-type custom-0 with funct7 = 0; RoCCDecode claims ALL of
+  // custom-0 and reads funct3 as a register-usage code, so the two tables would hand
+  // DecodeLogic contradictory outputs for the same instruction and the result would be
+  // whatever the minimiser happened to pick.  Refuse to elaborate instead.
+  require(!(coreParams.usePExt && usingRoCC),
+    "usePExt and RoCC both claim the custom-0 opcode on this hart; move the accelerator " +
+    "to custom-1/2/3 (chipyard puts Gemmini in custom-3) or drop usePExt on this tile")
   val decode_table = {
     (if (usingMulDiv) new MDecode(pipelinedMul) +: (xLen > 32).option(new M64Decode(pipelinedMul)).toSeq else Nil) ++:
     (if (usingAtomics) new ADecode +: (xLen > 32).option(new A64Decode).toSeq else Nil) ++:
     (if (fLen >= 32)    new FDecode +: (xLen > 32).option(new F64Decode).toSeq else Nil) ++:
     (if (fLen >= 64)    new DDecode +: (xLen > 32).option(new D64Decode).toSeq else Nil) ++:
     (if (minFLen == 16) new HDecode +: (xLen > 32).option(new H64Decode).toSeq ++: (fLen >= 64).option(new HDDecode).toSeq else Nil) ++:
-    (usingRoCC.option(new RoCCDecode)) ++:
+    (usingRoCC.option(p(RoCCDecodeOpcodes).map(o => new RoCCDecodeDeclared(o)).getOrElse(new RoCCDecode))) ++:  // patches/0101
     (if (xLen == 32) new I32Decode else new I64Decode) +:
     (usingVM.option(new SVMDecode)) ++:
     (usingSupervisor.option(new SDecode)) ++:
@@ -242,6 +254,10 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
     (if (coreParams.useZba) new ZbaDecode +: (xLen > 32).option(new Zba64Decode).toSeq else Nil) ++:
     (if (coreParams.useZbb) Seq(new ZbbDecode, if (xLen == 32) new Zbb32Decode else new Zbb64Decode) else Nil) ++:
     coreParams.useZbs.option(new ZbsDecode) ++:
+    // MBP packed SIMD.  Absent on a hart without usePExt, so custom-0 decodes as
+    // illegal there and traps -- which is the intended heterogeneity mechanism, not
+    // a degradation path.  See PEXT_SPEC.md section 7.6.
+    coreParams.usePExt.option(new PExtDecode) ++:
     Seq(new IDecode)
   } flatMap(_.table)
 
@@ -424,7 +440,22 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   // vector work and break preemption.
   val id_vec_tc_busy    = io.vector.map(_.trap_check_busy).getOrElse(false.B)
   val id_vec_mem_busy   = io.vector.map(_.vec_mem_busy).getOrElse(false.B)
-  val id_take_interrupt = csr.io.interrupt && !id_vec_tc_busy && !id_vec_mem_busy
+  // V-race fix v3 (saturn-vec-sresp-defer, Rocket-only): a Saturn writes_xrf scalar_resp (vmv.x.s etc.)
+  // is delivered decoupled to ll_arb.in(2). If an async interrupt ATTACHES to that op (or a neighbor)
+  // while it/its resp is in flight, the resp lands in the trap context and clobbers its dest GPR
+  // (mcause 5/2 at eager-V vstate_restore). Defer the interrupt across the whole in-flight window:
+  //   in-pipe writes_xrf op (ID/EX/MEM/WB) -- covers the attach/pre-WB window v1/v2 missed;
+  //   + post-WB outstanding counter -- covers the VU->Queue->fire tail; + resp.valid (belt).
+  // wxd-specific (not the vwmul/vwadd vec loop) -> ~4 cyc/reduction -> no timer starvation.
+  val vec_sresp_pending     = io.vector.map(v => v.resp.valid && !v.resp.bits.fp).getOrElse(false.B)
+  val vec_sresp_outstanding = RegInit(0.U(3.W))   // updated after sboard.set (EDIT 3)
+  val vec_wxd_inpipe =
+        (id_ctrl.vec   && id_ctrl.wxd) ||
+        (ex_reg_valid  && ex_ctrl.vec  && ex_ctrl.wxd) ||
+        (mem_reg_valid && mem_ctrl.vec && mem_ctrl.wxd) ||
+        (wb_reg_valid  && wb_ctrl.vec  && wb_ctrl.wxd)
+  val id_take_interrupt = csr.io.interrupt && !id_vec_tc_busy && !id_vec_mem_busy &&
+        !(vec_wxd_inpipe || (vec_sresp_outstanding =/= 0.U) || vec_sresp_pending)
   val id_do_fence = WireDefault(id_rocc_busy && (id_ctrl.fence || id_csr_rocc_write) ||
     id_vec_busy && id_ctrl.fence ||
     id_mem_busy && (id_ctrl.amo && id_amo_rl || id_ctrl.fence_i || id_reg_fence && (id_ctrl.mem || id_ctrl.rocc)))
@@ -440,7 +471,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   val id_xcpt0 = ibuf.io.inst(0).bits.xcpt0
   val id_xcpt1 = ibuf.io.inst(0).bits.xcpt1
   val (id_xcpt, id_cause) = checkExceptions(List(
-    (csr.io.interrupt, csr.io.interrupt_cause),
+    (id_take_interrupt, csr.io.interrupt_cause),
     (bpu.io.debug_if,  CSR.debugTriggerCause.U),
     (bpu.io.xcpt_if,   Causes.breakpoint.U),
     (id_xcpt0.pf.inst, Causes.fetch_page_fault.U),
@@ -1023,6 +1054,18 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   }
   val id_sboard_hazard = checkHazards(hazard_targets, rd => sboard.read(rd) && !id_sboard_clear_bypass(rd))
   sboard.set(wb_set_sboard && wb_wen, wb_waddr)
+  // V-RACE CANDIDATE #2-ALL (drain-stall div+rocc+vec): stall ID while ANY decoupled scalar writeback
+  // (div=in0/rocc=in1/vec=in2) is outstanding, so its resp drains in-context before a switch repurposes
+  // the dest GPR. Deadlock-free (ID stall; in-flight ops drain -> wb_wxd falls -> ll_arb fires -> release).
+  val dwb_inc = wb_reg_valid && wb_wen && (wb_ctrl.div || wb_ctrl.rocc || wb_ctrl.vec)
+  val dwb_dec = ll_arb.io.out.fire   // any div/rocc/vec grant (dmem-replay uses ll_wen, not out.fire)
+  val dwb_outstanding = RegInit(0.U(4.W))
+  dwb_outstanding := dwb_outstanding + dwb_inc.asUInt - dwb_dec.asUInt
+  // V-race fix v3: track post-WB in-flight vec scalar resps (see id_take_interrupt above).
+  val vec_sresp_inc  = wb_valid && wb_ctrl.vec && wb_ctrl.wxd
+  val vec_sresp_fire = ll_arb.io.in(2).fire
+  when (vec_sresp_inc && !vec_sresp_fire && vec_sresp_outstanding =/= 7.U) { vec_sresp_outstanding := vec_sresp_outstanding + 1.U }
+  .elsewhen (!vec_sresp_inc && vec_sresp_fire && vec_sresp_outstanding =/= 0.U) { vec_sresp_outstanding := vec_sresp_outstanding - 1.U }
 
   // stall for RAW/WAW hazards on CSRs, loads, AMOs, and mul/div in execute stage.
   val ex_cannot_bypass = ex_ctrl.csr =/= CSR.N || ex_ctrl.jalr || ex_ctrl.mem || ex_ctrl.mul || ex_ctrl.div || ex_ctrl.fp || ex_ctrl.rocc || ex_ctrl.vec
@@ -1069,7 +1112,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   rocc_blocked := !wb_xcpt && !io.rocc.cmd.ready && (io.rocc.cmd.valid || rocc_blocked)
 
   val ctrl_stalld =
-    id_ex_hazard || id_mem_hazard || id_wb_hazard || id_sboard_hazard ||
+    id_ex_hazard || id_mem_hazard || id_wb_hazard || id_sboard_hazard || (dwb_outstanding =/= 0.U) ||
     id_vconfig_hazard ||
     csr.io.singleStep && (ex_reg_valid || mem_reg_valid || wb_reg_valid) ||
     id_csr_en && csr.io.decode(0).fp_csr && !io.fpu.fcsr_rdy ||
